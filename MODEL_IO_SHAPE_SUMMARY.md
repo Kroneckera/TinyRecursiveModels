@@ -5,6 +5,44 @@ This document explains the input/output shapes of the Tiny Recursive Model (TRM)
 
 ---
 
+## What is ARC-AGI?
+
+### The Challenge
+**ARC-AGI (Abstraction and Reasoning Corpus)** is a benchmark designed by François Chollet to measure AI's ability to acquire new skills and solve novel problems through abstract reasoning, rather than pattern memorization.
+
+**Key Properties:**
+- Each puzzle demonstrates a unique transformation pattern
+- Only 3-5 training examples provided per puzzle
+- Tests genuine reasoning ability, not memorization
+- Human-solvable (most humans can solve ~80%)
+- Extremely challenging for AI systems (most LLMs <5%)
+
+### Dataset Versions
+
+This codebase supports multiple ARC-AGI dataset versions:
+
+| Version | Subsets | Total Puzzles | Purpose |
+|---------|---------|---------------|---------|
+| **ARC-AGI-1** | training: 400<br>evaluation: 400<br>concept: 160 | 960 | Original 2019 benchmark |
+| **ARC-AGI-2** | training2: 1000<br>evaluation2: 120<br>concept: 160 | 1280 | Expanded 2024 benchmark |
+
+**Important**: Cannot train on both ARC-1 and ARC-2 together because ARC-2 training set contains some ARC-1 evaluation puzzles.
+
+### TRM Performance
+
+**State-of-the-art results with only 7M parameters:**
+- **ARC-AGI-1**: 45% accuracy on evaluation set
+- **ARC-AGI-2**: 8% accuracy on evaluation set
+
+For context:
+- Human performance: ~80%
+- Previous SOTA (HRM): ~40% on ARC-1
+- Most large language models: <5%
+
+This demonstrates that **"less is more"** - recursive reasoning with a tiny network can achieve what billion-parameter models cannot.
+
+---
+
 ## Data Format: ARC-AGI Puzzles
 
 ### Puzzle Structure
