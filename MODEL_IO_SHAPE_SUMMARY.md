@@ -194,11 +194,15 @@ Total parameters: ~7M
 
 ## Model Output Shape
 
-### Training Output
+### Output Logits (Always Fixed Size)
+**Yes, the model ALWAYS predicts full 30×30×12 logits!**
+
 ```python
 {
-  "logits":             # Shape: (batch_size, seq_len=900, vocab_size=12)
-                        # Predicted token probabilities for output grid
+  "logits":             # Shape: (batch_size, 900, 12)
+                        # - 900 = 30×30 flattened (ALWAYS this size)
+                        # - 12 = vocab size (PAD, EOS, digits 0-9)
+                        # - Predicted token probabilities for ALL positions
 
   "q_halt_logits":      # Shape: (batch_size,)
                         # Q-value for halting (ACT)
@@ -208,50 +212,137 @@ Total parameters: ~7M
 }
 ```
 
-### Inference Output
-The model outputs predicted tokens which are then:
-1. Reshaped to 30×30 grid
-2. Value-unmapped (subtract 2, clip negatives to 0)
-3. Cropped to actual output size (determined by EOS markers or expected size)
+**Important**:
+- The model architecture has a **fixed output size** of 900×12, regardless of actual grid size
+- Small grids (e.g., 3×3) still produce 900 predictions, but only the first 9 positions matter
+- Padding positions and positions beyond EOS markers are ignored during loss computation
+- The actual output grid size is determined during **post-processing**, not during model forward pass
+
+### Post-Processing (Cropping to Actual Size)
+Located in: `evaluators/arc.py:_crop()`
+
+After getting logits from the model:
+1. **Argmax**: Get predicted tokens from logits: `preds = argmax(logits, dim=-1)` → shape (batch_size, 900)
+2. **Reshape**: Reshape to 2D grid: `grid = reshape(preds, (30, 30))` → shape (30, 30)
+3. **Crop**: Find the largest rectangle without EOS (token=1) inside
+4. **Unmap values**: Subtract 2 to get back to 0-9 range
+5. **Result**: Variable-sized output grid (e.g., 3×3, 9×9, 15×20, etc.)
 
 ---
 
 ## How Test Cases Work
 
+### Original ARC-AGI Puzzle Structure
+Each ARC-AGI puzzle consists of:
+- **Train examples**: 3-5 input-output pairs demonstrating a transformation pattern
+- **Test examples**: 1+ input grids where the output must be predicted using the learned pattern
+
+Example:
+```json
+{
+  "007bbfb7": {
+    "train": [
+      {"input": [[0,7,7], [7,7,7], ...], "output": [[0,0,0], [7,7,7], ...]},
+      {"input": [[7,0,7], ...], "output": [[7,7,7], ...]},
+      {"input": [[...]], "output": [[...]]},
+      {"input": [[...]], "output": [[...]]},
+      {"input": [[...]], "output": [[...]]}
+    ],
+    "test": [
+      {"input": [[7,0,7], [7,0,7], ...]}
+    ]
+  }
+}
+```
+
+### Dataset Splitting in This Codebase
+Located in: `dataset/build_arc_dataset.py:load_puzzles_arcagi()`
+
+The build process splits ARC examples into training and test datasets:
+
+```python
+# Line 168-172
+train_examples_dest = ("train", "all")     # ARC "train" → dataset "train" split
+test_examples_dest  = ("test", "all")      # ARC "test" → dataset "test" split
+```
+
+**Result after `build_arc_dataset.py`:**
+```
+data/arc1concept-aug-1000/
+  train/                         ← TRAINING DATASET
+    all__inputs.npy              # Contains 5 train example INPUTS
+    all__labels.npy              # Contains 5 train example OUTPUTS
+    all__puzzle_identifiers.npy  # All 5 have same puzzle_id (e.g., 123)
+
+  test/                          ← SEPARATE TEST DATASET
+    all__inputs.npy              # Contains 1 test example INPUT
+    all__labels.npy              # Contains 1 test example OUTPUT (for eval)
+    all__puzzle_identifiers.npy  # Same puzzle_id=123 as train examples
+```
+
+**Critical Points**:
+- ✅ **Train and test ARE split into separate dataset folders**
+- ✅ Each example is stored as a **separate data point**, NOT concatenated together!
+- ✅ During training, the model ONLY sees examples from the `train/` folder
+- ✅ During inference, the model processes examples from the `test/` folder
+- ✅ Both splits share the same `puzzle_identifier` for the same puzzle
+
 ### Training Phase
-1. **Multiple examples per puzzle**: The model sees several (input, output) pairs from the same puzzle during training
-2. **Shared puzzle identifier**: All examples from puzzle X share identifier ID=X
-3. **Puzzle embeddings**: The model learns a unique embedding for each puzzle ID
-4. **Pattern learning**: By seeing multiple examples with the same puzzle_id, the model learns the transformation rule for that puzzle
+1. **Individual examples**: Each of the 5 train examples becomes a separate batch item
+   - Batch item 1: `input_1 (900 tokens)` → `output_1 (900 tokens)`, puzzle_id=123
+   - Batch item 2: `input_2 (900 tokens)` → `output_2 (900 tokens)`, puzzle_id=123
+   - Batch item 3: `input_3 (900 tokens)` → `output_3 (900 tokens)`, puzzle_id=123
+   - etc.
+
+2. **Not in-context learning**: The model does NOT see multiple examples in a single forward pass like:
+   ```
+   ❌ WRONG: [input_1, output_1, input_2, output_2, input_3, output_3, input_test, ???]
+   ```
+
+3. **Learning mechanism**:
+   - All examples share the same `puzzle_identifier` (e.g., 123)
+   - The model learns a **puzzle-specific embedding** for ID=123
+   - Over many training iterations, it learns: "puzzle_id=123 → transformation rule T"
+   - The puzzle embedding stores the learned transformation pattern
 
 ### Inference Phase
-1. **Given**: New input grid from a known puzzle type
+1. **Given**: Test input grid from a puzzle seen during training
 2. **Process**:
-   - Convert input grid to sequence (as in training)
-   - Use the same puzzle_identifier as training examples
-   - Model applies learned transformation
-   - Decode output sequence back to grid
+   - Convert test input grid to 900-token sequence
+   - Use the **same puzzle_identifier** as the train examples (e.g., 123)
+   - Model retrieves the learned embedding for puzzle_id=123
+   - Applies the learned transformation via recursive reasoning
+   - Outputs predicted sequence (900 tokens)
+   - Decode sequence back to output grid
+
 3. **Result**: Predicted output grid
 
 ### Example Workflow
 ```
-Training:
-- Puzzle #123, Example 1: input_1 → output_1  (puzzle_id=123)
-- Puzzle #123, Example 2: input_2 → output_2  (puzzle_id=123)
-- Puzzle #123, Example 3: input_3 → output_3  (puzzle_id=123)
-  → Model learns: puzzle_id=123 corresponds to transformation rule T
+Training (over many epochs):
+  Batch step 15:  Puzzle #123, train_ex_1: input_1 → output_1  (puzzle_id=123)
+  Batch step 73:  Puzzle #123, train_ex_2: input_2 → output_2  (puzzle_id=123)
+  Batch step 142: Puzzle #123, train_ex_3: input_3 → output_3  (puzzle_id=123)
+  Batch step 205: Puzzle #123, train_ex_4: input_4 → output_4  (puzzle_id=123)
+  Batch step 381: Puzzle #123, train_ex_5: input_5 → output_5  (puzzle_id=123)
+  ...
+  → Model gradually learns: "puzzle_id=123 has transformation pattern T"
+  → This pattern is encoded in the learned embedding for puzzle_id=123
 
 Inference:
-- Puzzle #123, Test: input_test → ???  (puzzle_id=123)
-  → Model applies learned rule T
+  Test input: Puzzle #123, test_ex: input_test → ???  (puzzle_id=123)
+  → Model loads embedding for puzzle_id=123
+  → Applies learned transformation T via recursive reasoning
   → Outputs: predicted_output_test
 ```
 
 ### Key Insight
 The model doesn't learn a single universal transformation function. Instead:
-- It learns **puzzle-specific transformations** via puzzle embeddings
-- Each puzzle_identifier acts as a key to retrieve the learned transformation rule
-- The recursive reasoning process applies the transformation iteratively to refine the output
+- It learns **puzzle-specific transformations** stored in puzzle embeddings
+- Each puzzle_identifier acts as a key to retrieve the learned transformation pattern
+- The recursive reasoning process applies and refines the transformation iteratively
+- Training examples from the same puzzle teach the model the pattern through their shared ID
+- **This is NOT few-shot in-context learning** - it's learning via puzzle-specific parameters
 
 ---
 
